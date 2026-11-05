@@ -5,8 +5,18 @@ const MODELS = ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-flash-lite-
 const BASE = "https://generativelanguage.googleapis.com/v1beta/models/";
 const RETRY_STATUSES = [404, 429, 500, 503];
 
-api.action.onClicked.addListener((tab) => {
-  api.tabs.sendMessage(tab.id, { type: "toggle" }).catch(() => {});
+api.action.onClicked.addListener(async (tab) => {
+  try {
+    await api.tabs.sendMessage(tab.id, { type: "toggle" });
+  } catch (e) {
+    // Content script is not in the page (site access not granted yet): inject it, then toggle
+    try {
+      await api.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+      await api.tabs.sendMessage(tab.id, { type: "toggle" });
+    } catch (e2) {
+      console.error("Gemini Panel: cannot open panel on this page:", e2);
+    }
+  }
 });
 
 api.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

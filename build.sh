@@ -31,5 +31,7 @@ xcodebuild -project "$PROJ" -scheme "$APP" -configuration Debug \
 
 rm -rf "/Applications/$APP.app"
 cp -R "$OUT/derived/Build/Products/Debug/$APP.app" /Applications/
+rm -rf "$OUT/derived/Build/Products/Debug/$APP.app"  # avoid a duplicate extension entry in Safari
+rm -rf "$OUT/derived/Build/Products/Debug/$APP.app"  # avoid a duplicate extension entry in Safari
 open "/Applications/$APP.app"
 echo "Done. Enable it in Safari > Settings > Extensions."
