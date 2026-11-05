@@ -211,7 +211,7 @@
   const HTML = `
     <div class="p">
       <div class="top">
-        <span class="title">Gemini</span>
+        <span class="title">Gemini-3.5-flash</span>
         <span class="tools">
           <button class="ic" id="new" title="New chat" aria-label="New chat"><svg viewBox="0 0 16 16"><path d="M9 2.5H4.5A1.5 1.5 0 0 0 3 4v7.5A1.5 1.5 0 0 0 4.5 13H12a1.5 1.5 0 0 0 1.5-1.5V7M11.5 2l2.5 2.5L8 10.5 5.5 11l.5-2.5z"/></svg></button>
           <button class="ic" id="cfg" title="Settings" aria-label="Settings"><svg viewBox="0 0 16 16"><path d="M2.5 5h11M2.5 11h11"/><circle cx="6" cy="5" r="1.7"/><circle cx="10" cy="11" r="1.7"/></svg></button>
