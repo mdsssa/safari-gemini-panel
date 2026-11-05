@@ -2,6 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+if [ -f .env.local ]; then . ./.env.local; fi
 : "${TEAM_ID:?Usage: TEAM_ID=ABCDE12345 BUNDLE_ID=com.yourname.geminipanel ./build.sh}"
 BUNDLE_ID="${BUNDLE_ID:-com.example.geminipanel}"
 APP="Gemini Panel"
@@ -25,7 +26,7 @@ if [ -d icons/AppIcon.appiconset ]; then
 fi
 
 xcodebuild -project "$PROJ" -scheme "$APP" -configuration Debug \
-  -derivedDataPath "$OUT/derived" -allowProvisioningUpdates \
+  -derivedDataPath "$OUT/derived" -allowProvisioningUpdates -quiet \
   DEVELOPMENT_TEAM="$TEAM_ID" CODE_SIGN_STYLE=Automatic \
   CODE_SIGN_IDENTITY="Apple Development" build
 
