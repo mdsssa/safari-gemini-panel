@@ -26,10 +26,6 @@
   let pushOn = true;     // push the page aside instead of covering it
   let pushSaved = null;  // the page's own inline margin-right, restored on close
 
-  try {
-    api.storage.local.get("pushPage").then((r) => { if (r && r.pushPage === false) pushOn = false; }).catch(() => {});
-  } catch (e) {}
-
   function applyPush(on) {
     const h = document.documentElement;
     if (on) {
@@ -43,6 +39,15 @@
       pushSaved = null;
     }
   }
+
+  // Per-tab state (chat, context mode, panel open) lives in the background script, keyed by tab id
+  const MAX_SAVED = 40;
+  let ready = null;
+  function saveState() {
+    const state = { open: !!host, mode, history: history.slice(-MAX_SAVED) };
+    try { api.runtime.sendMessage({ type: "tab-state-set", state }).catch(() => {}); } catch (e) {}
+  }
+  const validEntry = (h) => h && (h.role === "user" || h.role === "model") && typeof h.text === "string";
 
   function esc(s) {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -115,7 +120,7 @@
   });
 
   api.runtime.onMessage.addListener((msg) => {
-    if (msg.type === "toggle") toggle();
+    if (msg.type === "toggle") (ready || Promise.resolve()).then(toggle);
   });
 
   function toggle() {
@@ -125,9 +130,11 @@
       applyPush(false);
       host.remove();
       host = null;
+      saveState();
       return;
     }
     build();
+    saveState();
   }
 
   const CSS = `
@@ -241,6 +248,7 @@
     </div>`;
 
   function build() {
+    if (host) return;
     host = document.createElement("div");
     host.style.cssText = "all:initial;position:fixed;top:0;right:0;height:100vh;width:" + PANEL_W + "px;z-index:2147483647;";
     const root = host.attachShadow({ mode: "closed" });
@@ -271,7 +279,7 @@
       seg.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.dataset.m === m));
       input.placeholder = PLACEHOLDERS[m];
       updateInfo();
-      if (save) { try { api.storage.local.set({ ctxMode: m }); } catch (e) {} }
+      if (save) saveState();
     }
     MODES.forEach(([id, label]) => {
       const b = el("button"); b.dataset.m = id; b.textContent = label;
@@ -280,11 +288,6 @@
     });
     onSelChange = updateInfo;
     setMode(mode, false);
-    try {
-      api.storage.local.get("ctxMode").then((r) => {
-        if (r && MODES.some((x) => x[0] === r.ctxMode)) setMode(r.ctxMode, false);
-      }).catch(() => {});
-    } catch (e) {}
 
     function addUser(text) {
       empty.hidden = true;
@@ -342,6 +345,7 @@
 
     function run() {
       busy = true; syncSend();
+      saveState();
       box.querySelectorAll(".regen").forEach((n) => n.remove());
       const b = addAssistant();
       b.body.innerHTML = '<span class="dots"><i></i><i></i><i></i></span>';
@@ -375,6 +379,7 @@
         busy = false; current = null;
         renderMd(b.body, text);
         history.push({ role: "model", text });
+        saveState();
         if (errMsg) { const n = el("div", "note"); n.textContent = "Response interrupted: " + errMsg; b.d.appendChild(n); }
         addActions(b.d, text, true);
         syncSend();
@@ -426,6 +431,9 @@
         addActions(b.d, h.text, i === history.length - 1);
       }
     });
+    if (history.length && history[history.length - 1].role === "user") {
+      fail(addAssistant(), "No answer was received for the last question.");
+    }
 
     sendBtn.onclick = () => { if (busy) { if (current) current.stop(); } else send(); };
     input.addEventListener("input", fit);
@@ -441,6 +449,7 @@
       history = [];
       box.querySelectorAll(".msg").forEach((n) => n.remove());
       empty.hidden = false;
+      saveState();
     };
     const pushBox = $("push");
     pushBox.checked = pushOn;
@@ -466,4 +475,22 @@
     syncSend();
     input.focus();
   }
+
+  async function init() {
+    let saved = null;
+    try {
+      const r = await api.runtime.sendMessage({ type: "tab-state-get" });
+      saved = r && r.state;
+    } catch (e) {}
+    try {
+      const p = await api.storage.local.get("pushPage");
+      if (p && p.pushPage === false) pushOn = false;
+    } catch (e) {}
+    if (saved) {
+      if (Array.isArray(saved.history)) history = saved.history.filter(validEntry);
+      if (MODES.some((x) => x[0] === saved.mode)) mode = saved.mode;
+      if (saved.open && !host) build();
+    }
+  }
+  ready = init();
 })();

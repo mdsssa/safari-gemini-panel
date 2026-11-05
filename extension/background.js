@@ -22,6 +22,42 @@ api.action.onClicked.addListener(async (tab) => {
   }
 });
 
+// Per-tab state (chat history, context mode, panel open). A content script cannot know its own tab id,
+// so it asks us; sender.tab.id is the key. storage.session is wiped when the browser quits; if the browser
+// lacks it we fall back to storage.local and clear the entries on startup (tab ids are not stable across restarts).
+const stateArea = (api.storage && api.storage.session) || api.storage.local;
+const tabKey = (id) => "tab:" + id;
+
+api.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || (msg.type !== "tab-state-get" && msg.type !== "tab-state-set")) return;
+  const tabId = sender && sender.tab && sender.tab.id;
+  if (tabId == null) { sendResponse({ state: null }); return; }
+  (async () => {
+    if (msg.type === "tab-state-get") {
+      const r = await stateArea.get(tabKey(tabId));
+      sendResponse({ state: r[tabKey(tabId)] || null });
+    } else {
+      await stateArea.set({ [tabKey(tabId)]: msg.state });
+      sendResponse({ ok: true });
+    }
+  })().catch(() => sendResponse({ state: null }));
+  return true; // async response
+});
+
+api.tabs.onRemoved.addListener((tabId) => {
+  Promise.resolve(stateArea.remove(tabKey(tabId))).catch(() => {});
+});
+
+async function clearTabStates() {
+  const all = await stateArea.get(null);
+  const keys = Object.keys(all).filter((k) => k.startsWith("tab:"));
+  if (keys.length) await stateArea.remove(keys);
+}
+if (stateArea === api.storage.local) {
+  api.runtime.onStartup.addListener(() => clearTabStates().catch(() => {}));
+  api.runtime.onInstalled.addListener(() => clearTabStates().catch(() => {}));
+}
+
 // The panel talks to us over a long-lived port so answers can be streamed chunk by chunk
 api.runtime.onConnect.addListener((port) => {
   if (port.name !== "gemini") return;
@@ -39,7 +75,8 @@ api.runtime.onConnect.addListener((port) => {
 function systemPrompt(c) {
   let s =
     "You are an assistant in a browser side panel. Reply in the language the user writes in. " +
-    "Be concise and to the point.";
+    "Be concise and to the point. This conversation belongs to one browser tab, so earlier messages " +
+    "may have been about other pages the user visited in it.";
   if (c.mode === "page") {
     s += "\n\nThe user is looking at the page below.\n" +
       `URL: ${c.url}\nTitle: ${c.title}\n` +
