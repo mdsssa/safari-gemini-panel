@@ -7,8 +7,10 @@
   const MAX_CHARS = 30000;
   const PANEL_W = 380;
   const SUGGESTIONS = ["Summarize this page", "List the key points", "Explain it simply"];
-  const MODES = [["page", "Page"], ["selection", "Selection"], ["none", "None"]];
-  const PLACEHOLDERS = { page: "Ask about this page", selection: "Ask about the selection", none: "Ask anything" };
+  const A = window.GeminiAgent; // page toolkit from agent.js (agent mode is hidden if it is missing)
+  const MODES = [["page", "Page"], ["selection", "Selection"], ["none", "None"]].concat(A ? [["agent", "Agent"]] : []);
+  const PLACEHOLDERS = { page: "Ask about this page", selection: "Ask about the selection", none: "Ask anything", agent: "Describe a task for this tab" };
+  const MAX_STEPS = 15;
 
   const svg = (d) => '<svg viewBox="0 0 16 16">' + d + "</svg>";
   const ICON_COPY = svg('<rect x="5.5" y="5.5" width="8" height="8" rx="1.8"/><path d="M10.5 5.5V4A1.8 1.8 0 0 0 8.7 2.2H4A1.8 1.8 0 0 0 2.2 4v4.7A1.8 1.8 0 0 0 4 10.5h1.5"/>');
@@ -25,6 +27,7 @@
   let onSelChange = null;
   let pushOn = true;     // push the page aside instead of covering it
   let pushSaved = null;  // the page's own inline margin-right, restored on close
+  let autoOn = false;    // agent: do not ask before ordinary actions (risky ones and other sites still ask)
 
   function applyPush(on) {
     const h = document.documentElement;
@@ -41,13 +44,23 @@
   }
 
   // Per-tab state (chat, context mode, panel open) lives in the background script, keyed by tab id
-  const MAX_SAVED = 40;
+  const MAX_SAVED = 60;
+  const newAgent = () => ({ active: false, goal: "", steps: 0, hosts: [], auto: false, model: null, pending: null, expectNav: false });
+  let agent = newAgent();
+  let runToken = 0;
   let ready = null;
-  function saveState() {
-    const state = { open: !!host, mode, history: history.slice(-MAX_SAVED) };
-    try { api.runtime.sendMessage({ type: "tab-state-set", state }).catch(() => {}); } catch (e) {}
+  // keep the newest MAX_SAVED entries, but never start in the middle of a tool exchange
+  function trimmed(h) {
+    if (h.length <= MAX_SAVED) return h.slice();
+    let i = h.length - MAX_SAVED;
+    while (i < h.length && !(h[i].role === "user" && !h[i].parts)) i++;
+    return i < h.length ? h.slice(i) : h.slice();
   }
-  const validEntry = (h) => h && (h.role === "user" || h.role === "model") && typeof h.text === "string";
+  function saveState() {
+    const state = { open: !!host, mode, history: trimmed(history), agent };
+    try { return api.runtime.sendMessage({ type: "tab-state-set", state }).catch(() => {}); } catch (e) { return Promise.resolve(); }
+  }
+  const validEntry = (h) => h && (h.role === "user" || h.role === "model") && (typeof h.text === "string" || Array.isArray(h.parts));
 
   function esc(s) {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -213,12 +226,27 @@
     .send:disabled { opacity: .3; cursor: default; }
     .send svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; }
     .send .stop-sq { fill: currentColor; stroke: none; }
+    .step { display: flex; align-items: flex-start; gap: 8px; color: var(--mut); font-size: 12px; padding: 1px 2px; }
+    .step .dot { flex: none; width: 7px; height: 7px; border-radius: 50%; margin-top: 5px; background: var(--mut); }
+    .step.run .dot { background: var(--acc); animation: b 1.2s infinite; }
+    .step.ok .dot { background: #30b050; }
+    .step.err .dot { background: #e5484d; }
+    .step.deny .dot { background: #d99a00; }
+    .step .t { overflow-wrap: anywhere; }
+    .ask { border: 1px solid var(--line); background: var(--field); border-radius: 12px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+    .ask-t { font-weight: 600; overflow-wrap: anywhere; }
+    .ask-d { color: var(--mut); font-size: 12px; }
+    .ask-d:empty { display: none; }
+    .ask-b { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+    .ask-btn { border: 1px solid var(--line); background: none; color: var(--fg); border-radius: 8px; padding: 3px 10px; cursor: pointer; }
+    .ask-btn.pri { background: var(--acc); border-color: var(--acc); color: #fff; }
+    .ask-r { color: var(--mut); font-size: 12px; }
   `;
 
   const HTML = `
     <div class="p">
       <div class="top">
-        <span class="title">Gemini-3.5-flash</span>
+        <span class="title">Gemini</span>
         <span class="tools">
           <button class="ic" id="new" title="New chat" aria-label="New chat"><svg viewBox="0 0 16 16"><path d="M9 2.5H4.5A1.5 1.5 0 0 0 3 4v7.5A1.5 1.5 0 0 0 4.5 13H12a1.5 1.5 0 0 0 1.5-1.5V7M11.5 2l2.5 2.5L8 10.5 5.5 11l.5-2.5z"/></svg></button>
           <button class="ic" id="cfg" title="Settings" aria-label="Settings"><svg viewBox="0 0 16 16"><path d="M2.5 5h11M2.5 11h11"/><circle cx="6" cy="5" r="1.7"/><circle cx="10" cy="11" r="1.7"/></svg></button>
@@ -229,6 +257,8 @@
         <label for="k">Gemini API key</label>
         <div class="row"><input id="k" type="password" placeholder="AIza..." autocomplete="off" spellcheck="false"><button class="pill" id="save">Save</button></div>
         <label class="chk"><input type="checkbox" id="push"> Push the page aside instead of covering it</label>
+        <label class="chk"><input type="checkbox" id="auto"> Agent: do not ask before ordinary actions</label>
+        <div class="hint">Clicks, typing and same-site navigation then run without a prompt. Purchases, sends, deletes and links to other sites still ask.</div>
         <div class="hint"><span id="st">Stored locally in the extension.</span> <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener noreferrer">Get a key</a></div>
       </div>
       <div class="msgs" id="m">
@@ -272,6 +302,7 @@
       info.textContent =
         mode === "page" ? (n ? "Reads this page and your selection (" + n + " chars)" : "Reads the text of this page")
         : mode === "selection" ? (n ? n + " characters selected" : "Select text on the page first")
+        : mode === "agent" ? "Can read and act on this tab. Asks before risky actions."
         : "No page context is sent";
     }
     function setMode(m, save) {
@@ -332,12 +363,12 @@
       syncSend();
     };
 
-    function fail(b, msg) {
+    function fail(b, msg, retry) {
       busy = false; current = null; syncSend();
       b.d.className = "msg e";
       b.d.textContent = msg;
       const r = el("button", "retry"); r.textContent = "Retry";
-      r.onclick = () => { b.d.remove(); run(); };
+      r.onclick = () => { b.d.remove(); (retry || run)(); };
       b.d.appendChild(r);
       if (/api key/i.test(msg)) $("set").hidden = false;
       box.scrollTop = box.scrollHeight;
@@ -399,9 +430,9 @@
     function send(textArg) {
       const q = (textArg ?? input.value).trim();
       if (!q || busy) return;
-      // drop a question left unanswered by a failed request
-      if (history.length && history[history.length - 1].role === "user") history.pop();
       input.value = ""; fit();
+      if (mode === "agent") { startAgent(q); return; }
+      sanitizeTail();
       addUser(q);
       history.push({ role: "user", text: q });
       run();
@@ -410,11 +441,305 @@
     function regenerate() {
       if (busy) return;
       const last = history[history.length - 1];
-      if (!last || last.role !== "model") return;
+      if (!last || last.role !== "model" || last.ag) return;
       history.pop();
       const bubbles = box.querySelectorAll(".msg.a");
       if (bubbles.length) bubbles[bubbles.length - 1].remove();
       run();
+    }
+
+    // ---------- agent mode ----------
+    const callsOf = (m) => (m.parts || []).filter((p) => p.functionCall).map((p) => p.functionCall);
+    const known = (h) => agent.hosts.includes(A.stripWww(h));
+
+    // a question that never got an answer is dropped; an unfinished tool exchange is closed with a model turn
+    function sanitizeTail() {
+      const last = history[history.length - 1];
+      if (!last || last.role !== "user") return;
+      if (last.parts) history.push({ role: "model", text: "(interrupted)", parts: [{ text: "(interrupted)" }] });
+      else history.pop();
+    }
+
+    function addStep(desc, status) {
+      empty.hidden = true;
+      const d = el("div", "step " + (status || "run")), t = el("span", "t");
+      t.textContent = desc;
+      d.append(el("span", "dot"), t);
+      box.appendChild(d);
+      box.scrollTop = box.scrollHeight;
+      const s = { set(st, extra) { d.className = "step " + st; t.textContent = extra ? desc + " - " + extra : desc; return s; } };
+      return s;
+    }
+
+    let askResolve = null;
+    function ask(title, detail, canTask) {
+      return new Promise((resolve) => {
+        empty.hidden = true;
+        const d = el("div", "ask"), t = el("div", "ask-t"), p = el("div", "ask-d"), row = el("div", "ask-b");
+        t.textContent = title; p.textContent = detail || "";
+        const finish = (val, label) => {
+          askResolve = null; row.remove();
+          const r = el("div", "ask-r"); r.textContent = label; d.appendChild(r);
+          resolve(val);
+        };
+        const mk = (label, val, cls, result) => {
+          const b = el("button", "ask-btn " + (cls || "")); b.textContent = label;
+          b.onclick = () => finish(val, result); row.appendChild(b);
+        };
+        mk("Allow", "once", "pri", "Allowed");
+        if (canTask) mk("Allow for this task", "task", "", "Allowed for this task");
+        mk("Deny", "deny", "", "Denied");
+        d.append(t, p, row); box.appendChild(d); box.scrollTop = box.scrollHeight;
+        askResolve = () => finish("deny", "Cancelled");
+      });
+    }
+
+    function describeCall(c) {
+      const a = c.args || {};
+      const lab = (id) => { const d = A.describe(id); return d.error ? "[" + id + "]" : "[" + id + '] "' + A.clip(d.label, 40) + '"'; };
+      switch (c.name) {
+        case "click": return "Click " + lab(a.id);
+        case "type_text": {
+          const d = A.describe(a.id);
+          return "Type in " + lab(a.id) + (d && d.protected ? " (protected field)" : ': "' + A.clip(a.text, 40) + '"') + (a.submit ? " + Enter" : "");
+        }
+        case "select_option": return 'Select "' + A.clip(a.value, 30) + '" in ' + lab(a.id);
+        case "scroll": return "Scroll " + (a.direction || "down");
+        case "find_text": return 'Find "' + A.clip(a.query, 40) + '"';
+        case "get_page_text": return "Read the page text";
+        case "navigate": return "Open " + A.clip(a.url, 70);
+        case "go_back": return "Go back";
+        case "wait": return "Wait " + (a.seconds || 1) + "s";
+        default: return String(c.name);
+      }
+    }
+
+    // Runs ONE tool call. Reads and scrolling run freely; clicks, typing, selecting and navigation ask first.
+    // Hard rules: protected fields are never touched, risky clicks and other-site moves always ask.
+    async function execCall(c, token, rec) {
+      const a = c.args || {};
+      const desc = describeCall(c);
+      rec.desc = desc;
+      const log = addStep(desc);
+      const out = (status, message, extra, more) => {
+        const st = status === "ok" ? "ok" : status === "denied" ? "deny" : "err";
+        rec.status = st; rec.extra = extra || "";
+        log.set(st, extra || "");
+        return Object.assign({ status, message }, more || {});
+      };
+      try {
+        switch (c.name) {
+          case "scroll": {
+            const moved = A.scrollPage(String(a.direction || "down"));
+            await A.sleep(300);
+            return out("ok", moved ? "Scrolled." : "The page did not move (already at that end, or it scrolls inside a container).", moved ? "" : "no movement");
+          }
+          case "find_text": {
+            const r = A.findText(a.query);
+            await A.sleep(250);
+            return r.found ? out("ok", "Found it and scrolled there: " + r.context) : out("error", "That text is not in the visible page.", "not found");
+          }
+          case "get_page_text": return out("ok", "The full page text is in text_untrusted.", "", { text_untrusted: A.pageText() });
+          case "wait":
+            await A.sleep(Math.min(5, Math.max(0.5, Number(a.seconds) || 1)) * 1000);
+            return out("ok", "Waited.");
+          case "go_back":
+            agent.expectNav = true; await saveState();
+            window.history.back();
+            await A.sleep(1500);
+            agent.expectNav = false;
+            return out("ok", "Went back (or there was nothing to go back to).");
+          case "navigate": {
+            let u;
+            try { u = new URL(String(a.url), location.href); } catch (e) { return out("error", "That is not a valid URL.", "bad URL"); }
+            if (!/^https?:$/.test(u.protocol)) return out("error", "Only http and https URLs can be opened.", "blocked");
+            const cross = !known(u.hostname);
+            if (cross || !agent.auto) {
+              const ch = await ask((cross ? "Leaves this site: " : "Gemini wants to: ") + desc, cross ? "This is a different site (" + u.hostname + ")." : "", !cross);
+              if (token !== runToken) return out("denied", "Stopped.");
+              if (ch === "deny") return out("denied", "The user declined this navigation. Do not retry it; ask what to do instead.", "declined");
+              if (ch === "task") agent.auto = true;
+              if (cross) agent.hosts.push(A.stripWww(u.hostname));
+            }
+            agent.expectNav = true; await saveState();
+            location.href = u.href;
+            await A.sleep(4000);
+            agent.expectNav = false;
+            return out("ok", "Navigation started. If only the #hash changed, the page stays the same.");
+          }
+          case "click": case "type_text": case "select_option": {
+            const d = A.describe(a.id);
+            if (d.error) return out("error", d.error, "bad number");
+            if (c.name !== "click" && d.protected) return out("denied", "This field is protected. Ask the user to fill it in themselves.", "protected field");
+            const cross = c.name === "click" && !!d.linkHost && !known(d.linkHost);
+            const risky = (c.name === "click" && d.sensitive) || (c.name === "type_text" && !!a.submit && d.formProtected);
+            A.bringIntoView(d.el);
+            const undo = A.highlight(d.el);
+            if (cross || risky || !agent.auto) {
+              const lead = cross ? "Leaves this site: " : risky ? "Needs your OK: " : "Gemini wants to: ";
+              const why = cross ? "This link goes to " + d.linkHost + "."
+                : risky ? "This looks like a purchase, a message or another hard-to-undo action, so it always asks." : "";
+              const ch = await ask(lead + desc, why, !cross && !risky);
+              if (token !== runToken) { undo(); return out("denied", "Stopped."); }
+              if (ch === "deny") { undo(); return out("denied", "The user declined this action. Do not retry it; ask what to do instead.", "declined"); }
+              if (ch === "task") agent.auto = true;
+              if (cross) agent.hosts.push(A.stripWww(d.linkHost));
+            } else {
+              await A.sleep(350);
+            }
+            if (c.name === "click" || (c.name === "type_text" && a.submit)) { agent.expectNav = true; await saveState(); }
+            let r = { ok: true };
+            if (c.name === "click") A.click(d.el);
+            else if (c.name === "type_text") r = A.typeText(d.el, String(a.text == null ? "" : a.text), !!a.submit);
+            else r = A.selectOption(d.el, a.value);
+            await A.sleep(700);
+            undo();
+            agent.expectNav = false;
+            return r.ok ? out("ok", "Done.") : out("error", r.message, "failed");
+          }
+          default: return out("error", "Unknown tool: " + c.name, "unknown tool");
+        }
+      } catch (e) {
+        return out("error", String((e && e.message) || e), "failed");
+      }
+    }
+
+    const frPart = (c, r) => {
+      const response = { status: r.status, message: r.message };
+      if (r.text_untrusted) response.text_untrusted = r.text_untrusted;
+      return { functionResponse: Object.assign({ name: c.name }, c.id ? { id: c.id } : {}, { response }) };
+    };
+    // only the newest snapshot is worth sending again
+    const pruneOld = () => history.forEach((h) => (h.parts || []).forEach((p) => {
+      const r = p.functionResponse && p.functionResponse.response;
+      if (r && (r.page_untrusted || r.text_untrusted)) { delete r.page_untrusted; delete r.text_untrusted; r.note = "older page content omitted"; }
+    }));
+    const skipped = { status: "skipped", message: "Only one action per step is allowed. Repeat it if it is still needed." };
+
+    // makes the history valid again after an abort: every function call needs a response, and turns alternate
+    function closeHistory(note) {
+      let last = history[history.length - 1];
+      if (last && last.role === "model" && callsOf(last).length) {
+        history.push({ role: "user", text: "", parts: callsOf(last).map((c) => frPart(c, { status: "cancelled", message: note })) });
+        last = history[history.length - 1];
+      }
+      if (last && last.role === "user") history.push({ role: "model", text: note, parts: [{ text: note }], ag: true });
+    }
+
+    function stopAgent() {
+      if (!agent.active && !busy) return;
+      runToken++;
+      if (askResolve) askResolve();
+      closeHistory("Stopped by the user.");
+      agent.active = false; agent.pending = null; agent.expectNav = false;
+      busy = false; current = null; syncSend();
+      const b = addAssistant(); b.body.textContent = "Stopped.";
+      saveState();
+    }
+
+    function agentFail(msg) {
+      busy = false; current = null; syncSend();
+      fail(addAssistant(), msg, () => startLoop());
+      saveState();
+    }
+
+    function endAgent(msg) {
+      agent.active = false; agent.pending = null;
+      history.push({ role: "model", text: msg, parts: [{ text: msg }], ag: true });
+      const b = addAssistant(); renderMd(b.body, msg); addActions(b.d, msg, false);
+      busy = false; current = null; syncSend(); saveState();
+    }
+
+    async function agentLoop(token) {
+      while (token === runToken && agent.active) {
+        if (agent.steps >= MAX_STEPS) { endAgent("Step limit reached (" + MAX_STEPS + "). Tell me to continue if you want me to keep going."); return; }
+        let res;
+        // the first step has no tool result yet, so the page snapshot travels with the task itself
+        const tail = history[history.length - 1];
+        const snapshot = tail && tail.role === "user" && !tail.parts ? A.snapshot() : undefined;
+        try { res = await api.runtime.sendMessage({ type: "agent-step", history: history.slice(), model: agent.model, snapshot }); }
+        catch (e) { res = { error: String((e && e.message) || e) }; }
+        if (token !== runToken) return;
+        if (!res || res.error) { agentFail((res && res.error) || "No response from the extension."); return; }
+        agent.model = res.model || agent.model;
+        const calls = res.parts.filter((p) => p.functionCall).map((p) => p.functionCall);
+        const text = res.parts.filter((p) => p.text && !p.thought).map((p) => p.text).join("");
+        const entry = { role: "model", text, parts: res.parts, steps: [], ag: true };
+        history.push(entry);
+        if (text) { const b = addAssistant(); renderMd(b.body, text); if (!calls.length) addActions(b.d, text, false); }
+        if (!calls.length) {
+          agent.active = false; agent.pending = null;
+          busy = false; current = null; syncSend(); saveState();
+          return;
+        }
+        agent.pending = calls.map((c) => ({ name: c.name, id: c.id }));
+        const rec = { desc: "", status: "run", extra: "" };
+        entry.steps.push(rec);
+        await saveState();
+        const first = await execCall(calls[0], token, rec);
+        if (token !== runToken) return;
+        const frParts = calls.map((c, i) => frPart(c, i === 0 ? first : skipped));
+        frParts[0].functionResponse.response.page_untrusted = A.snapshot();
+        pruneOld();
+        history.push({ role: "user", text: "", parts: frParts });
+        agent.pending = null; agent.expectNav = false; agent.steps += 1;
+        await saveState();
+      }
+    }
+
+    function startLoop() {
+      busy = true; syncSend();
+      const token = ++runToken;
+      current = { stop: stopAgent };
+      saveState();
+      agentLoop(token).catch((e) => { if (token === runToken) agentFail(String((e && e.message) || e)); });
+    }
+
+    function startAgent(q) {
+      sanitizeTail();
+      addUser(q);
+      history.push({ role: "user", text: q });
+      agent = Object.assign(newAgent(), { active: true, goal: q, auto: autoOn, hosts: [A.stripWww(location.hostname)] });
+      startLoop();
+    }
+
+    // The page was reloaded or navigated while the agent was working
+    async function resumeAgent() {
+      const tail = history[history.length - 1];
+      busy = true; syncSend();
+      current = { stop: stopAgent };
+      if (tail && tail.role === "model" && callsOf(tail).length && agent.pending) {
+        const navigated = agent.expectNav;
+        agent.expectNav = false;
+        if (navigated && !known(location.hostname)) {
+          const ch = await ask("The page moved to " + location.hostname, "That site was not approved for this task. Continue there?", false);
+          if (!agent.active) return;
+          if (ch === "deny") { stopAgent(); return; }
+          agent.hosts.push(A.stripWww(location.hostname));
+        }
+        await A.sleep(400);
+        const calls = callsOf(tail);
+        const first = navigated
+          ? { status: "ok", message: "The page changed (navigation happened). The current page is below." }
+          : { status: "interrupted", message: "The page was reloaded before the action ran. Nothing was done." };
+        const frParts = calls.map((c, i) => frPart(c, i === 0 ? first : skipped));
+        frParts[0].functionResponse.response.page_untrusted = A.snapshot();
+        pruneOld();
+        history.push({ role: "user", text: "", parts: frParts });
+        agent.pending = null; agent.steps += 1;
+        await saveState();
+        if (navigated) { startLoop(); return; }
+        agentFail("The page was reloaded before the last action ran.");
+        return;
+      }
+      if (agent.active && tail && tail.role === "user") { agentFail("The task was interrupted when the page reloaded."); return; }
+      busy = false; current = null; syncSend();
+    }
+
+    function resumeTail() {
+      const tail = history[history.length - 1];
+      if (agent.active) { resumeAgent(); return; }
+      if (tail && tail.role === "user" && !tail.parts) fail(addAssistant(), "No answer was received for the last question.");
     }
 
     SUGGESTIONS.forEach((s) => {
@@ -424,16 +749,15 @@
     });
 
     history.forEach((h, i) => {
-      if (h.role === "user") addUser(h.text);
-      else {
+      if (h.role === "user") { if (!h.parts) addUser(h.text); return; }
+      if (h.text) {
         const b = addAssistant();
         renderMd(b.body, h.text);
-        addActions(b.d, h.text, i === history.length - 1);
+        addActions(b.d, h.text, i === history.length - 1 && !h.ag);
       }
+      (h.steps || []).forEach((s) => addStep(s.desc, s.status).set(s.status, s.extra));
     });
-    if (history.length && history[history.length - 1].role === "user") {
-      fail(addAssistant(), "No answer was received for the last question.");
-    }
+    resumeTail();
 
     sendBtn.onclick = () => { if (busy) { if (current) current.stop(); } else send(); };
     input.addEventListener("input", fit);
@@ -447,7 +771,8 @@
     $("new").onclick = () => {
       if (current) current.stop();
       history = [];
-      box.querySelectorAll(".msg").forEach((n) => n.remove());
+      agent = newAgent();
+      box.querySelectorAll(".msg,.step,.ask").forEach((n) => n.remove());
       empty.hidden = false;
       saveState();
     };
@@ -457,6 +782,13 @@
       pushOn = pushBox.checked;
       applyPush(pushOn);
       try { api.storage.local.set({ pushPage: pushOn }); } catch (e) {}
+    };
+    const autoBox = $("auto");
+    autoBox.checked = autoOn;
+    autoBox.onchange = () => {
+      autoOn = autoBox.checked;
+      if (agent.active) { agent.auto = autoOn; saveState(); }
+      try { api.storage.local.set({ autoApprove: autoOn }); } catch (e) {}
     };
     $("cfg").onclick = () => { $("set").hidden = !$("set").hidden; if (!$("set").hidden) $("k").focus(); };
     $("save").onclick = async () => {
@@ -483,12 +815,18 @@
       saved = r && r.state;
     } catch (e) {}
     try {
-      const p = await api.storage.local.get("pushPage");
+      const p = await api.storage.local.get(["pushPage", "autoApprove"]);
       if (p && p.pushPage === false) pushOn = false;
+      if (p && p.autoApprove === true) autoOn = true;
     } catch (e) {}
     if (saved) {
       if (Array.isArray(saved.history)) history = saved.history.filter(validEntry);
       if (MODES.some((x) => x[0] === saved.mode)) mode = saved.mode;
+      if (saved.agent && typeof saved.agent === "object") agent = Object.assign(newAgent(), saved.agent);
+      if (agent.active && agent.pending) {
+        const last = history[history.length - 1];
+        if (last && last.steps) last.steps.forEach((s) => { if (s.status === "run") s.status = agent.expectNav ? "ok" : "err"; });
+      }
       if (saved.open && !host) build();
     }
   }
