@@ -218,8 +218,24 @@ async function streamAnswer({ history, context }, post, outer) {
   post({ type: "error", error: "All models failed. Last error: " + lastErr });
 }
 
+// How long Google wants us to wait after 429/503: Retry-After header, RetryInfo in the body, or the text of the message
+function retryDelayMs(r, text, fallback) {
+  const h = r.headers && r.headers.get && r.headers.get("retry-after");
+  if (h && /^\d+$/.test(h)) return Number(h) * 1000;
+  try {
+    const j = JSON.parse(text);
+    const d = ((j.error && j.error.details) || []).find((x) => x && x.retryDelay);
+    const m = d && String(d.retryDelay).match(/^([\d.]+)s$/);
+    if (m) return Math.round(parseFloat(m[1]) * 1000);
+  } catch (e) {}
+  const m = String(text).match(/retry in ([\d.]+)\s*s/i);
+  if (m) return Math.round(parseFloat(m[1]) * 1000);
+  return fallback;
+}
+
 // One non-streaming model step for agent mode. The first step may use the fallback chain; after that the
-// caller pins the model (thought signatures belong to the model that produced them), so we only retry it.
+// caller pins the model (thought signatures belong to the model that produced them).
+// On 429/503 we do not wait here: we answer { retry, afterMs } and the panel shows a countdown and asks again.
 async function agentStep({ history, model, snapshot }) {
   const { apiKey } = await api.storage.local.get("apiKey");
   if (!apiKey) return { error: "No API key. Click the settings icon in the panel and paste it." };
@@ -229,36 +245,41 @@ async function agentStep({ history, model, snapshot }) {
     tools: [{ functionDeclarations: AGENT_TOOLS }],
   });
   const models = model ? [model] : MODELS;
-  const tries = model ? 3 : 1;
-  let lastErr = "";
+  let lastErr = "", retryMs = 0, reason = "", daily = false;
+  const wantRetry = (ms, why) => { retryMs = retryMs ? Math.min(retryMs, ms) : ms; reason = reason || why; };
   for (const m of models) {
-    for (let i = 0; i < tries; i++) {
-      try {
-        const r = await fetch(`${BASE}${m}:generateContent`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-          body,
-          signal: AbortSignal.timeout(60000),
-        });
-        if (r.ok) {
-          const j = await r.json();
-          const c = j.candidates && j.candidates[0];
-          const parts = (c && c.content && c.content.parts) || [];
-          if (parts.length) return { parts, model: m };
-          if (j.promptFeedback && j.promptFeedback.blockReason) return { error: "Blocked by Gemini: " + j.promptFeedback.blockReason };
-          lastErr = `${m}: empty response${c && c.finishReason ? " (" + c.finishReason + ")" : ""}`;
-          break;
-        }
-        lastErr = `${m}: HTTP ${r.status}`;
-        if (RETRY_STATUSES.includes(r.status)) {
-          if (i < tries - 1) await new Promise((res) => setTimeout(res, 1500 * (i + 1)));
-          continue;
-        }
-        return { error: `${lastErr} ${(await r.text()).slice(0, 300)}` };
-      } catch (e) {
-        lastErr = `${m}: ${(e && e.name === "TimeoutError") ? "timeout" : (e && e.message) || e}`;
+    try {
+      const r = await fetch(`${BASE}${m}:generateContent`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        body,
+        signal: AbortSignal.timeout(60000),
+      });
+      if (r.ok) {
+        const j = await r.json();
+        const c = j.candidates && j.candidates[0];
+        const parts = (c && c.content && c.content.parts) || [];
+        if (parts.length) return { parts, model: m };
+        if (j.promptFeedback && j.promptFeedback.blockReason) return { error: "Blocked by Gemini: " + j.promptFeedback.blockReason };
+        lastErr = `${m}: empty response${c && c.finishReason ? " (" + c.finishReason + ")" : ""}`;
+        continue;
       }
+      lastErr = `${m}: HTTP ${r.status}`;
+      const text = await r.text();
+      if (r.status === 429) {
+        if (/PerDay|per day/i.test(text)) { daily = true; continue; }
+        wantRetry(retryDelayMs(r, text, 5000), "Rate limit reached");
+        continue;
+      }
+      if (r.status === 503) { wantRetry(retryDelayMs(r, text, 3000), "Gemini is overloaded"); continue; }
+      if (!model && (r.status === 404 || r.status === 500)) continue; // another model in the chain may work
+      return { error: `${lastErr} ${text.slice(0, 300)}` };
+    } catch (e) {
+      lastErr = `${m}: ${(e && e.name === "TimeoutError") ? "timeout" : (e && e.message) || e}`;
+      if (e && e.name === "TimeoutError") wantRetry(3000, "Gemini did not answer in time");
     }
   }
+  if (retryMs) return { retry: true, afterMs: Math.min(Math.max(retryMs, 1000), 90000), reason, error: lastErr };
+  if (daily) return { error: "The daily quota for this model is used up (HTTP 429). Try again tomorrow, or use a key from another project." };
   return { error: "All models failed. Last error: " + lastErr };
 }

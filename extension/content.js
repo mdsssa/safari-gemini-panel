@@ -11,6 +11,7 @@
   const MODES = [["page", "Page"], ["selection", "Selection"], ["none", "None"]].concat(A ? [["agent", "Agent"]] : []);
   const PLACEHOLDERS = { page: "Ask about this page", selection: "Ask about the selection", none: "Ask anything", agent: "Describe a task for this tab" };
   const MAX_STEPS = 15;
+  const MAX_RETRIES = 6; // rate-limit retries per model call
 
   const svg = (d) => '<svg viewBox="0 0 16 16">' + d + "</svg>";
   const ICON_COPY = svg('<rect x="5.5" y="5.5" width="8" height="8" rx="1.8"/><path d="M10.5 5.5V4A1.8 1.8 0 0 0 8.7 2.2H4A1.8 1.8 0 0 0 2.2 4v4.7A1.8 1.8 0 0 0 4 10.5h1.5"/>');
@@ -650,17 +651,36 @@
       busy = false; current = null; syncSend(); saveState();
     }
 
+    // One model call. On 429/503 the background answers { retry, afterMs }: we show a countdown and ask again.
+    async function callModel(token) {
+      // the first step has no tool result yet, so the page snapshot travels with the task itself
+      const tail = history[history.length - 1];
+      const snapshot = tail && tail.role === "user" && !tail.parts ? A.snapshot() : undefined;
+      for (let attempt = 0; ; attempt++) {
+        let res;
+        try { res = await api.runtime.sendMessage({ type: "agent-step", history: history.slice(), model: agent.model, snapshot }); }
+        catch (e) { res = { error: String((e && e.message) || e) }; }
+        if (token !== runToken) return null;
+        if (!res || !res.retry) return res || { error: "No response from the extension." };
+        if (attempt >= MAX_RETRIES) {
+          return { error: (res.reason || "Gemini is busy") + " - still blocked after " + MAX_RETRIES + " retries. The free tier allows only a few requests per minute; wait a minute and press Retry." };
+        }
+        const note = addStep(res.reason || "Gemini is busy");
+        for (let sec = Math.ceil((res.afterMs || 5000) / 1000); sec > 0; sec--) {
+          if (token !== runToken) { note.set("deny", "cancelled"); return null; }
+          note.set("deny", "retrying in " + sec + "s");
+          await A.sleep(1000);
+        }
+        note.set("ok", "retrying");
+      }
+    }
+
     async function agentLoop(token) {
       while (token === runToken && agent.active) {
         if (agent.steps >= MAX_STEPS) { endAgent("Step limit reached (" + MAX_STEPS + "). Tell me to continue if you want me to keep going."); return; }
-        let res;
-        // the first step has no tool result yet, so the page snapshot travels with the task itself
-        const tail = history[history.length - 1];
-        const snapshot = tail && tail.role === "user" && !tail.parts ? A.snapshot() : undefined;
-        try { res = await api.runtime.sendMessage({ type: "agent-step", history: history.slice(), model: agent.model, snapshot }); }
-        catch (e) { res = { error: String((e && e.message) || e) }; }
-        if (token !== runToken) return;
-        if (!res || res.error) { agentFail((res && res.error) || "No response from the extension."); return; }
+        const res = await callModel(token);
+        if (token !== runToken || !res) return;
+        if (res.error) { agentFail((res && res.error) || "No response from the extension."); return; }
         agent.model = res.model || agent.model;
         const calls = res.parts.filter((p) => p.functionCall).map((p) => p.functionCall);
         const text = res.parts.filter((p) => p.text && !p.thought).map((p) => p.text).join("");
